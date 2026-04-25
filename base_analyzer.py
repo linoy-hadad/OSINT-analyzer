@@ -3,14 +3,16 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 import time
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 from PIL import Image
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
@@ -20,17 +22,32 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 ROWS_TO_PROCESS = 1
+ANALYST_COUNT = 8
+
 CSV_PATH = Path("military_bases.csv")
 OUTPUT_DIR = Path("screenshots")
 ANALYSIS_OUTPUT_DIR = Path("analyses")
+
 SCREENSHOT_WIDTH = 1024
 PAGE_LOAD_WAIT_SECONDS = 6
 VISUAL_READY_TIMEOUT_SECONDS = 45
 VISUAL_READY_POLL_SECONDS = 2
 WINDOW_SIZE = (1600, 900)
-EARTH_VIEW_SUFFIX = ",10.04969521a,1825.78590766d,30.00000016y,-0h,0t,0r"
+
+DEFAULT_ALTITUDE = 10.04969521
+DEFAULT_RANGE = 1825.78590766
+DEFAULT_YAW = 30.00000016
+DEFAULT_HEADING = -0.0
+DEFAULT_TILT = 0.0
+DEFAULT_ROLL = 0.0
+
+ZOOM_IN_FACTOR = 0.85
+ZOOM_OUT_FACTOR = 1.20
+LON_STEP_CITY = 0.001
+
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
+
 ALLOWED_ACTIONS = {"zoom-in", "zoom-out", "move-left", "move-right", "finish"}
 REQUIRED_GEMINI_KEYS = {
     "findings",
@@ -46,13 +63,143 @@ class GeminiAnalysisError(Exception):
         self.raw_response_text = raw_response_text
 
 
-def build_google_earth_url(latitude: str, longitude: str) -> str:
-    return f"https://earth.google.com/web/@{latitude},{longitude}{EARTH_VIEW_SUFFIX}"
+def format_camera_value(value: float) -> str:
+    return format(value, ".14f").rstrip("0").rstrip(".")
 
 
-def build_analysis_prompt(country: str) -> str:
+def build_google_earth_url(
+    latitude: float,
+    longitude: float,
+    altitude: float = DEFAULT_ALTITUDE,
+    range_value: float = DEFAULT_RANGE,
+    yaw: float = DEFAULT_YAW,
+    heading: float = DEFAULT_HEADING,
+    tilt: float = DEFAULT_TILT,
+    roll: float = DEFAULT_ROLL,
+) -> str:
+    return (
+        "https://earth.google.com/web/@"
+        f"{format_camera_value(latitude)},"
+        f"{format_camera_value(longitude)},"
+        f"{format_camera_value(altitude)}a,"
+        f"{format_camera_value(range_value)}d,"
+        f"{format_camera_value(yaw)}y,"
+        f"{format_camera_value(heading)}h,"
+        f"{format_camera_value(tilt)}t,"
+        f"{format_camera_value(roll)}r"
+    )
+
+
+def parse_camera_component(component: str, suffix: str, default: float) -> float:
+    cleaned = component.strip()
+    if cleaned.endswith(suffix):
+        cleaned = cleaned[:-1]
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        return default
+
+
+def parse_google_earth_url(url: str) -> dict[str, float]:
+    if "/@" not in url:
+        raise ValueError(f"Unsupported Google Earth URL format: {url}")
+
+    coordinate_part = url.split("/@", 1)[1].split("?", 1)[0]
+    parts = coordinate_part.split(",")
+    if len(parts) < 2:
+        raise ValueError(f"Google Earth URL is missing latitude/longitude: {url}")
+
+    latitude = float(parts[0])
+    longitude = float(parts[1])
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "altitude": parse_camera_component(parts[2], "a", DEFAULT_ALTITUDE)
+        if len(parts) > 2
+        else DEFAULT_ALTITUDE,
+        "range_value": parse_camera_component(parts[3], "d", DEFAULT_RANGE)
+        if len(parts) > 3
+        else DEFAULT_RANGE,
+        "yaw": parse_camera_component(parts[4], "y", DEFAULT_YAW)
+        if len(parts) > 4
+        else DEFAULT_YAW,
+        "heading": parse_camera_component(parts[5], "h", DEFAULT_HEADING)
+        if len(parts) > 5
+        else DEFAULT_HEADING,
+        "tilt": parse_camera_component(parts[6], "t", DEFAULT_TILT)
+        if len(parts) > 6
+        else DEFAULT_TILT,
+        "roll": parse_camera_component(parts[7], "r", DEFAULT_ROLL)
+        if len(parts) > 7
+        else DEFAULT_ROLL,
+    }
+
+
+def build_google_earth_url_from_state(camera_state: dict[str, float]) -> str:
+    return build_google_earth_url(
+        latitude=camera_state["latitude"],
+        longitude=camera_state["longitude"],
+        altitude=camera_state["altitude"],
+        range_value=camera_state["range_value"],
+        yaw=camera_state["yaw"],
+        heading=camera_state["heading"],
+        tilt=camera_state["tilt"],
+        roll=camera_state["roll"],
+    )
+
+
+def apply_action_to_camera_state(camera_state: dict[str, float], action: str) -> dict[str, float]:
+    next_state = dict(camera_state)
+
+    if action == "zoom-in":
+        next_state["range_value"] *= ZOOM_IN_FACTOR
+    elif action == "zoom-out":
+        next_state["range_value"] *= ZOOM_OUT_FACTOR
+    elif action == "move-left":
+        next_state["longitude"] -= LON_STEP_CITY
+    elif action == "move-right":
+        next_state["longitude"] += LON_STEP_CITY
+
+    return next_state
+
+
+def build_base_prompt(country: str) -> str:
     return f"""
 You are the world first expert in understanding satellite imagery and you work for the US army. We got intel that this area is a base/facility of the millitary of {country}. As an expert, analyze this image, find millitary related things - structures and anything suspicous.
+
+Respond ONLY with a valid JSON object with exactly these keys:
+{{
+  "findings": [
+    "A list of findings that you think are important for the US army to know, including all man-made structures, military equipment, and infrastructure. We are trying to find which systems, weapons, or equipment are present and used so focus on that."
+  ],
+  "analysis": "A detailed analysis of your findings. For example if you saw an F-35 airplane, explain what the capabilities of this airplane are and what it is mostly used for.",
+  "things_to_continue_analyzing": [
+    "A list of things that you think are important to continue analyzing in further images, like areas to focus on, zoom into, structures to investigate, and so on."
+  ],
+  "action": "One of: zoom-in, zoom-out, move-left, move-right, finish"
+}}
+
+Action rules:
+- Choose "zoom-in" if you need to zoom in the image.
+- Choose "zoom-out" if you need more context of the surrounding area or if you are zoomed in too much.
+- Choose "move-left" or "move-right" if you suspect there are important features just outside the current view.
+- Choose "finish" if you have a complete understanding of the location.
+
+Do not include markdown fences.
+Do not include any text before or after the JSON.
+If uncertain, say so clearly inside the JSON fields instead of inventing facts.
+""".strip()
+
+
+def build_analysis_prompt(country: str, history_of_analysts: dict[str, str] | None = None) -> str:
+    if not history_of_analysts:
+        return build_base_prompt(country)
+
+    serialized_history = json.dumps(history_of_analysts, indent=2, ensure_ascii=False)
+    return f"""
+You are the world first expert in understanding satellite imagery and you work for the US army. We got intel that this area is a base/facility of the millitary of {country}. Here is the analysis of previous analysts about this area and their recommendations. You can use this data but don't use it as fact, think for yourself: {serialized_history}
 
 Respond ONLY with a valid JSON object with exactly these keys:
 {{
@@ -92,13 +239,15 @@ def ensure_google_earth_links(csv_path: Path) -> list[dict[str, str]]:
 
     updated = False
     for row in rows:
-        latitude = (row.get("latitude") or "").strip()
-        longitude = (row.get("longitude") or "").strip()
+        latitude_text = (row.get("latitude") or "").strip()
+        longitude_text = (row.get("longitude") or "").strip()
         existing_link = (row.get("google_earth_link") or "").strip()
 
-        if not latitude or not longitude:
+        if not latitude_text or not longitude_text:
             continue
 
+        latitude = float(latitude_text)
+        longitude = float(longitude_text)
         expected_link = build_google_earth_url(latitude, longitude)
 
         if existing_link != expected_link:
@@ -207,9 +356,7 @@ def validate_gemini_response(data: object) -> dict[str, object]:
         raise ValueError("'action' must be a string.")
     action = action.strip()
     if action not in ALLOWED_ACTIONS:
-        raise ValueError(
-            f"'action' must be one of: {', '.join(sorted(ALLOWED_ACTIONS))}."
-        )
+        raise ValueError(f"'action' must be one of: {', '.join(sorted(ALLOWED_ACTIONS))}.")
 
     return {
         "findings": findings,
@@ -219,24 +366,12 @@ def validate_gemini_response(data: object) -> dict[str, object]:
     }
 
 
-def write_analysis_file(base_id: str, payload: dict[str, object]) -> None:
-    ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = ANALYSIS_OUTPUT_DIR / f"base_id_{base_id}.json"
-    with output_path.open("w", encoding="utf-8") as analysis_file:
-        json.dump(payload, analysis_file, indent=2, ensure_ascii=False)
-
-
-def analyze_screenshot(
+def analyze_image(
     client: genai.Client,
-    row: dict[str, str],
-    screenshot_path: Path,
-) -> dict[str, object]:
-    base_id = (row.get("id") or "").strip()
-    country = (row.get("country") or "").strip()
-    earth_url = (row.get("google_earth_link") or "").strip()
-    prompt = build_analysis_prompt(country)
-
-    image_bytes = screenshot_path.read_bytes()
+    image_path: Path,
+    prompt: str,
+) -> tuple[str, dict[str, object]]:
+    image_bytes = image_path.read_bytes()
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[
@@ -255,36 +390,14 @@ def analyze_screenshot(
     except (json.JSONDecodeError, ValueError) as error:
         raise GeminiAnalysisError(str(error), raw_response_text) from error
 
-    return {
-        "status": "success",
-        "base_id": base_id,
-        "country": country,
-        "image_path": str(screenshot_path),
-        "google_earth_link": earth_url,
-        "model": GEMINI_MODEL,
-        "prompt": prompt,
-        "result": normalized,
-    }
+    return raw_response_text, normalized
 
 
-def build_analysis_error_payload(
-    row: dict[str, str],
-    screenshot_path: Path | None,
-    prompt: str,
-    error: Exception,
-    raw_response_text: str | None = None,
-) -> dict[str, object]:
-    return {
-        "status": "error",
-        "base_id": (row.get("id") or "").strip(),
-        "country": (row.get("country") or "").strip(),
-        "image_path": str(screenshot_path) if screenshot_path is not None else None,
-        "google_earth_link": (row.get("google_earth_link") or "").strip(),
-        "model": GEMINI_MODEL,
-        "prompt": prompt,
-        "error": str(error),
-        "raw_response_text": raw_response_text,
-    }
+def write_analysis_file(base_id: str, payload: dict[str, Any]) -> None:
+    ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = ANALYSIS_OUTPUT_DIR / f"base_id_{base_id}.json"
+    with output_path.open("w", encoding="utf-8") as analysis_file:
+        json.dump(payload, analysis_file, indent=2, ensure_ascii=False)
 
 
 def hide_page_toolbars(driver: webdriver.Chrome) -> None:
@@ -338,45 +451,157 @@ def wait_for_earth_view(driver: webdriver.Chrome) -> bytes:
     raise TimeoutException("Google Earth view remained mostly black before timeout.")
 
 
-def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> None:
+def capture_current_view(driver: webdriver.Chrome, earth_url: str, output_path: Path) -> None:
+    driver.get(earth_url)
+    screenshot_bytes = wait_for_earth_view(driver)
+    hide_page_toolbars(driver)
+    time.sleep(1)
+    screenshot_bytes = driver.get_screenshot_as_png()
+    resize_and_save_as_jpeg(screenshot_bytes, output_path)
+
+
+def build_error_response_text(message: str) -> str:
+    return json.dumps({"status": "error", "error": message}, ensure_ascii=False)
+
+
+def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> dict[str, dict[str, str]]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     rows_to_handle = rows[:ROWS_TO_PROCESS]
+    history_of_analysts_by_row: dict[str, dict[str, str]] = {}
 
     if not rows_to_handle:
         print("No rows available to process.")
-        return
+        return history_of_analysts_by_row
 
     driver = create_driver()
     try:
         for index, row in enumerate(rows_to_handle, start=1):
             base_id = (row.get("id") or "").strip()
             country = (row.get("country") or "").strip()
-            earth_url = (row.get("google_earth_link") or "").strip()
-            prompt = build_analysis_prompt(country)
+            initial_earth_url = (row.get("google_earth_link") or "").strip()
 
             if not base_id:
                 print(f"Row {index}: missing id, skipping.")
                 continue
 
-            if not earth_url:
+            if not initial_earth_url:
                 print(f"Row {index} (id={base_id}): missing google_earth_link, skipping.")
                 continue
 
             print(f"Processing row {index}/{len(rows_to_handle)} for base id {base_id}...")
 
-            try:
-                driver.get(earth_url)
-                screenshot_bytes = wait_for_earth_view(driver)
-                hide_page_toolbars(driver)
-                time.sleep(1)
-                screenshot_bytes = driver.get_screenshot_as_png()
-                output_path = OUTPUT_DIR / f"base_id_{base_id}.jpg"
-                resize_and_save_as_jpeg(screenshot_bytes, output_path)
-                print(f"Saved {output_path}")
+            screenshot_folder = OUTPUT_DIR / f"base_{base_id}"
+            screenshot_folder.mkdir(parents=True, exist_ok=True)
+
+            current_url = initial_earth_url
+            current_camera_state = parse_google_earth_url(current_url)
+            history_of_analysts: dict[str, str] = {}
+            history_of_analysts_by_row[base_id] = history_of_analysts
+            analyst_steps: list[dict[str, Any]] = []
+
+            current_image_path: Path | None = None
+            capture_new_image = True
+            freeze_view = False
+
+            for analyst_number in range(1, ANALYST_COUNT + 1):
+                analyst_key = f"analyst_{analyst_number}"
+                analyst_image_path = screenshot_folder / f"{analyst_key}.jpg"
+                input_image_path = analyst_image_path
+                prompt = build_analysis_prompt(
+                    country=country,
+                    history_of_analysts=history_of_analysts if analyst_number > 1 else None,
+                )
+                input_url = current_url
+
+                if capture_new_image:
+                    try:
+                        capture_current_view(driver, current_url, analyst_image_path)
+                        print(f"Saved {analyst_image_path}")
+                        current_image_path = analyst_image_path
+                        capture_new_image = False
+                    except (TimeoutException, WebDriverException, OSError) as error:
+                        error_message = f"Screenshot capture failed: {error}"
+                        raw_response_text = build_error_response_text(error_message)
+                        history_of_analysts[analyst_key] = raw_response_text
+                        analyst_steps.append(
+                            {
+                                "analyst_number": analyst_number,
+                                "input_image_path": str(analyst_image_path),
+                                "input_url": input_url,
+                                "raw_response_text": raw_response_text,
+                                "validated_response": None,
+                                "action": None,
+                                "next_url": current_url,
+                                "status": "error",
+                                "error": error_message,
+                            }
+                        )
+                        print(f"Row {index} (id={base_id}): {error_message}")
+                        continue
+                elif current_image_path is not None and current_image_path != analyst_image_path:
+                    shutil.copy2(current_image_path, analyst_image_path)
+                    print(f"Reused image for {analyst_key}: {analyst_image_path}")
+                    current_image_path = analyst_image_path
+
+                if input_image_path is None or not input_image_path.exists():
+                    error_message = "No screenshot available for Gemini analysis."
+                    raw_response_text = build_error_response_text(error_message)
+                    history_of_analysts[analyst_key] = raw_response_text
+                    analyst_steps.append(
+                        {
+                            "analyst_number": analyst_number,
+                            "input_image_path": str(input_image_path),
+                            "input_url": input_url,
+                            "raw_response_text": raw_response_text,
+                            "validated_response": None,
+                            "action": None,
+                            "next_url": current_url,
+                            "status": "error",
+                            "error": error_message,
+                        }
+                    )
+                    print(f"Row {index} (id={base_id}): {error_message}")
+                    continue
 
                 try:
-                    analysis_payload = analyze_screenshot(gemini_client, row, output_path)
+                    raw_response_text, validated_response = analyze_image(
+                        gemini_client,
+                        input_image_path,
+                        prompt,
+                    )
+                    history_of_analysts[analyst_key] = raw_response_text
+                    action = str(validated_response["action"])
+
+                    next_url = current_url
+                    if not freeze_view:
+                        if action == "finish":
+                            freeze_view = True
+                            capture_new_image = False
+                        else:
+                            current_camera_state = apply_action_to_camera_state(
+                                current_camera_state,
+                                action,
+                            )
+                            next_url = build_google_earth_url_from_state(current_camera_state)
+                            current_url = next_url
+                            capture_new_image = True
+
+                    analyst_steps.append(
+                        {
+                            "analyst_number": analyst_number,
+                            "input_image_path": str(input_image_path),
+                            "input_url": input_url,
+                            "raw_response_text": raw_response_text,
+                            "validated_response": validated_response,
+                            "action": action,
+                            "next_url": next_url,
+                            "status": "success",
+                            "error": None,
+                        }
+                    )
+                    print(f"Saved Gemini response for {analyst_key}")
                 except Exception as error:
                     raw_response_text = getattr(error, "raw_response_text", None)
                     if raw_response_text is None and hasattr(error, "response"):
@@ -384,26 +609,42 @@ def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> Non
                         if response is not None:
                             raw_response_text = str(response)
 
-                    analysis_payload = build_analysis_error_payload(
-                        row=row,
-                        screenshot_path=output_path,
-                        prompt=prompt,
-                        error=error,
-                        raw_response_text=raw_response_text,
+                    error_message = str(error)
+                    if raw_response_text is None:
+                        raw_response_text = build_error_response_text(error_message)
+
+                    history_of_analysts[analyst_key] = raw_response_text
+                    analyst_steps.append(
+                        {
+                            "analyst_number": analyst_number,
+                            "input_image_path": str(input_image_path),
+                            "input_url": input_url,
+                            "raw_response_text": raw_response_text,
+                            "validated_response": None,
+                            "action": None,
+                            "next_url": current_url,
+                            "status": "error",
+                            "error": error_message,
+                        }
                     )
                     print(f"Row {index} (id={base_id}): Gemini analysis failed: {error}")
-                else:
-                    print(f"Saved analysis for base id {base_id}")
 
-                write_analysis_file(base_id, analysis_payload)
-            except TimeoutException as error:
-                print(f"Row {index} (id={base_id}): timed out waiting for map imagery: {error}")
-            except WebDriverException as error:
-                print(f"Row {index} (id={base_id}): browser error: {error}")
-            except OSError as error:
-                print(f"Row {index} (id={base_id}): image save error: {error}")
+            analysis_payload = {
+                "base_id": base_id,
+                "country": country,
+                "model": GEMINI_MODEL,
+                "initial_google_earth_link": initial_earth_url,
+                "final_google_earth_link": current_url,
+                "screenshot_folder": str(screenshot_folder),
+                "history_of_analysts": history_of_analysts,
+                "analyst_steps": analyst_steps,
+            }
+            write_analysis_file(base_id, analysis_payload)
+            print(f"Saved combined analysis for base id {base_id}")
     finally:
         driver.quit()
+
+    return history_of_analysts_by_row
 
 
 def main() -> None:
