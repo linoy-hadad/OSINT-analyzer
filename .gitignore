@@ -1,5 +1,11 @@
 *.csv
 *.txt
+.env
 /scrennshots
 /logs
 *.log
+/venv
+__pycache__/
+*.pyc
+*.pyo
+/analyses
