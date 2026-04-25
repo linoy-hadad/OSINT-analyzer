@@ -1,2 +1,5 @@
 *.csv
 *.txt
+/scrennshots
+/logs
+*.log
