@@ -26,7 +26,7 @@ ANALYST_COUNT = 8
 
 CSV_PATH = Path("military_bases.csv")
 OUTPUT_DIR = Path("screenshots")
-ANALYSIS_OUTPUT_DIR = Path("analyses")
+DATA_JSON_PATH = Path("data.json")
 
 SCREENSHOT_WIDTH = 1024
 PAGE_LOAD_WAIT_SECONDS = 6
@@ -45,15 +45,21 @@ ZOOM_IN_FACTOR = 0.85
 ZOOM_OUT_FACTOR = 1.20
 LON_STEP_CITY = 0.001
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+ANALYST_MODEL = "gemini-2.5-flash-lite"
+COMMANDER_MODEL = "gemini-2.5-flash"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 
 ALLOWED_ACTIONS = {"zoom-in", "zoom-out", "move-left", "move-right", "finish"}
-REQUIRED_GEMINI_KEYS = {
+REQUIRED_ANALYST_KEYS = {
     "findings",
     "analysis",
     "things_to_continue_analyzing",
     "action",
+}
+REQUIRED_COMMANDER_KEYS = {
+    "findings",
+    "analysis",
+    "final_steps",
 }
 
 
@@ -225,6 +231,31 @@ If uncertain, say so clearly inside the JSON fields instead of inventing facts.
 """.strip()
 
 
+def build_commander_prompt(history_of_analysts: dict[str, str]) -> str:
+    serialized_history = json.dumps(history_of_analysts, indent=2, ensure_ascii=False)
+    return f"""
+You are a commander of intelligence analysts in the us military. Your analysts got this image and an intel that this area is probably an enemy base/area. Here is the history of what the analysts said (each one was written by a different analyst) - {serialized_history}. As their commander, you should read their estimates and give a final conclustion that includes:
+1. findings: summary of all the findings your analysts found plus things you noticed yourself. This part should include only findings, structures, and everything that can be seen in the image.
+2. analysis: your final analysis based on what your analysts think and what you additionally add. Tell us what this place is, the chances that the intel is correct, and the meaning of the findings.
+3. final_steps: tell us what the us army should do with that, for example follow this base regularly, ignore it, get more images, or prepare an intelligence document.
+
+Respond ONLY with a valid JSON object with exactly these keys:
+{{
+  "findings": [
+    "A list summarizing the visible findings from the image and the analyst history."
+  ],
+  "analysis": "Your final commander analysis.",
+  "final_steps": [
+    "A list of recommended next steps."
+  ]
+}}
+
+Do not include markdown fences.
+Do not include any text before or after the JSON.
+If uncertain, say so clearly inside the JSON fields instead of inventing facts.
+""".strip()
+
+
 def ensure_google_earth_links(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
         reader = csv.DictReader(csv_file)
@@ -261,6 +292,24 @@ def ensure_google_earth_links(csv_path: Path) -> list[dict[str, str]]:
             writer.writerows(rows)
 
     return rows
+
+
+def load_data_json() -> dict[str, Any]:
+    if not DATA_JSON_PATH.exists():
+        return {}
+
+    with DATA_JSON_PATH.open("r", encoding="utf-8") as data_file:
+        loaded = json.load(data_file)
+
+    if not isinstance(loaded, dict):
+        raise ValueError("data.json must contain a top-level JSON object.")
+
+    return loaded
+
+
+def save_data_json(data: dict[str, Any]) -> None:
+    with DATA_JSON_PATH.open("w", encoding="utf-8") as data_file:
+        json.dump(data, data_file, indent=2, ensure_ascii=False)
 
 
 def create_gemini_client() -> genai.Client:
@@ -331,11 +380,11 @@ def normalize_string_list(value: object, field_name: str) -> list[str]:
     return normalized_items
 
 
-def validate_gemini_response(data: object) -> dict[str, object]:
+def validate_analyst_response(data: object) -> dict[str, object]:
     if not isinstance(data, dict):
         raise ValueError("Gemini response must be a JSON object.")
 
-    missing_keys = REQUIRED_GEMINI_KEYS - data.keys()
+    missing_keys = REQUIRED_ANALYST_KEYS - data.keys()
     if missing_keys:
         missing = ", ".join(sorted(missing_keys))
         raise ValueError(f"Gemini response missing required keys: {missing}")
@@ -366,14 +415,39 @@ def validate_gemini_response(data: object) -> dict[str, object]:
     }
 
 
-def analyze_image(
+def validate_commander_response(data: object) -> dict[str, object]:
+    if not isinstance(data, dict):
+        raise ValueError("Commander response must be a JSON object.")
+
+    missing_keys = REQUIRED_COMMANDER_KEYS - data.keys()
+    if missing_keys:
+        missing = ", ".join(sorted(missing_keys))
+        raise ValueError(f"Commander response missing required keys: {missing}")
+
+    findings = normalize_string_list(data["findings"], "findings")
+    final_steps = normalize_string_list(data["final_steps"], "final_steps")
+
+    analysis = data["analysis"]
+    if not isinstance(analysis, str):
+        raise ValueError("'analysis' must be a string.")
+    analysis = analysis.strip()
+
+    return {
+        "findings": findings,
+        "analysis": analysis,
+        "final_steps": final_steps,
+    }
+
+
+def call_gemini_with_image(
     client: genai.Client,
     image_path: Path,
     prompt: str,
-) -> tuple[str, dict[str, object]]:
+    model: str,
+) -> str:
     image_bytes = image_path.read_bytes()
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=model,
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
             prompt,
@@ -384,20 +458,71 @@ def analyze_image(
     if not raw_response_text:
         raise GeminiAnalysisError("Gemini returned an empty response.")
 
+    return raw_response_text
+
+
+def analyze_image(
+    client: genai.Client,
+    image_path: Path,
+    prompt: str,
+) -> tuple[str, dict[str, object]]:
+    raw_response_text = call_gemini_with_image(
+        client=client,
+        image_path=image_path,
+        prompt=prompt,
+        model=ANALYST_MODEL,
+    )
+
     try:
         parsed = json.loads(raw_response_text)
-        normalized = validate_gemini_response(parsed)
+        normalized = validate_analyst_response(parsed)
     except (json.JSONDecodeError, ValueError) as error:
         raise GeminiAnalysisError(str(error), raw_response_text) from error
 
     return raw_response_text, normalized
 
 
-def write_analysis_file(base_id: str, payload: dict[str, Any]) -> None:
-    ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = ANALYSIS_OUTPUT_DIR / f"base_id_{base_id}.json"
-    with output_path.open("w", encoding="utf-8") as analysis_file:
-        json.dump(payload, analysis_file, indent=2, ensure_ascii=False)
+def analyze_commander(
+    client: genai.Client,
+    image_path: Path,
+    history_of_analysts: dict[str, str],
+) -> dict[str, Any]:
+    prompt = build_commander_prompt(history_of_analysts)
+
+    try:
+        raw_response_text = call_gemini_with_image(
+            client=client,
+            image_path=image_path,
+            prompt=prompt,
+            model=COMMANDER_MODEL,
+        )
+        parsed = json.loads(raw_response_text)
+        normalized = validate_commander_response(parsed)
+        return {
+            "model": COMMANDER_MODEL,
+            "input_image_path": str(image_path),
+            "prompt": prompt,
+            "raw_response_text": raw_response_text,
+            "validated_response": normalized,
+            "status": "success",
+            "error": None,
+        }
+    except Exception as error:
+        raw_response_text = getattr(error, "raw_response_text", None)
+        if raw_response_text is None and hasattr(error, "response"):
+            response = getattr(error, "response", None)
+            if response is not None:
+                raw_response_text = str(response)
+
+        return {
+            "model": COMMANDER_MODEL,
+            "input_image_path": str(image_path),
+            "prompt": prompt,
+            "raw_response_text": raw_response_text,
+            "validated_response": None,
+            "status": "error",
+            "error": str(error),
+        }
 
 
 def hide_page_toolbars(driver: webdriver.Chrome) -> None:
@@ -464,9 +589,12 @@ def build_error_response_text(message: str) -> str:
     return json.dumps({"status": "error", "error": message}, ensure_ascii=False)
 
 
-def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> dict[str, dict[str, str]]:
+def process_rows(
+    rows: list[dict[str, str]],
+    gemini_client: genai.Client,
+    persisted_data: dict[str, Any],
+) -> dict[str, dict[str, str]]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     rows_to_handle = rows[:ROWS_TO_PROCESS]
     history_of_analysts_by_row: dict[str, dict[str, str]] = {}
@@ -486,6 +614,10 @@ def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> dic
                 print(f"Row {index}: missing id, skipping.")
                 continue
 
+            if base_id in persisted_data:
+                print(f"Row {index} (id={base_id}): already exists in data.json, skipping.")
+                continue
+
             if not initial_earth_url:
                 print(f"Row {index} (id={base_id}): missing google_earth_link, skipping.")
                 continue
@@ -502,6 +634,7 @@ def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> dic
             analyst_steps: list[dict[str, Any]] = []
 
             current_image_path: Path | None = None
+            first_image_path: Path | None = None
             capture_new_image = True
             freeze_view = False
 
@@ -520,6 +653,8 @@ def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> dic
                         capture_current_view(driver, current_url, analyst_image_path)
                         print(f"Saved {analyst_image_path}")
                         current_image_path = analyst_image_path
+                        if first_image_path is None:
+                            first_image_path = analyst_image_path
                         capture_new_image = False
                     except (TimeoutException, WebDriverException, OSError) as error:
                         error_message = f"Screenshot capture failed: {error}"
@@ -629,18 +764,36 @@ def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> dic
                     )
                     print(f"Row {index} (id={base_id}): Gemini analysis failed: {error}")
 
-            analysis_payload = {
+            commander_payload = {
+                "model": COMMANDER_MODEL,
+                "input_image_path": str(first_image_path) if first_image_path is not None else None,
+                "prompt": build_commander_prompt(history_of_analysts),
+                "raw_response_text": None,
+                "validated_response": None,
+                "status": "error",
+                "error": "Commander analysis could not run because the first screenshot is missing.",
+            }
+            if first_image_path is not None and first_image_path.exists():
+                commander_payload = analyze_commander(
+                    gemini_client,
+                    first_image_path,
+                    history_of_analysts,
+                )
+
+            place_record = {
                 "base_id": base_id,
                 "country": country,
-                "model": GEMINI_MODEL,
                 "initial_google_earth_link": initial_earth_url,
                 "final_google_earth_link": current_url,
                 "screenshot_folder": str(screenshot_folder),
                 "history_of_analysts": history_of_analysts,
                 "analyst_steps": analyst_steps,
+                "commander": commander_payload,
             }
-            write_analysis_file(base_id, analysis_payload)
-            print(f"Saved combined analysis for base id {base_id}")
+
+            persisted_data[base_id] = place_record
+            save_data_json(persisted_data)
+            print(f"Saved place {base_id} to data.json")
     finally:
         driver.quit()
 
@@ -650,8 +803,9 @@ def process_rows(rows: list[dict[str, str]], gemini_client: genai.Client) -> dic
 def main() -> None:
     load_dotenv()
     rows = ensure_google_earth_links(CSV_PATH)
+    persisted_data = load_data_json()
     gemini_client = create_gemini_client()
-    process_rows(rows, gemini_client)
+    process_rows(rows, gemini_client, persisted_data)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,4 @@
 *.csv
-*.txt
 .env
 /screenshots
 /logs
@@ -9,3 +8,4 @@ __pycache__/
 *.pyc
 *.pyo
 /analyses
+*.json
