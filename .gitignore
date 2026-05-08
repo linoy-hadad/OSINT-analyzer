@@ -9,3 +9,5 @@ __pycache__/
 *.pyo
 /analyses
 *.json
+/logs
+/.stramlit 

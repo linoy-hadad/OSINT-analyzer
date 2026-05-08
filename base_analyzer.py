@@ -518,6 +518,27 @@ def is_transient_gemini_error(value: object) -> bool:
     return any(marker in text for marker in transient_markers)
 
 
+def extract_json_object_text(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    if cleaned.startswith("{"):
+        return cleaned
+
+    start_index = cleaned.find("{")
+    end_index = cleaned.rfind("}")
+    if start_index != -1 and end_index != -1 and end_index > start_index:
+        return cleaned[start_index : end_index + 1]
+
+    return cleaned
+
+
 def call_gemini_with_image(
     client: genai.Client,
     image_path: Path,
@@ -573,7 +594,7 @@ def analyze_image(
     )
 
     try:
-        parsed = json.loads(raw_response_text)
+        parsed = json.loads(extract_json_object_text(raw_response_text))
         normalized = validate_analyst_response(parsed)
     except (json.JSONDecodeError, ValueError) as error:
         raise GeminiAnalysisError(str(error), raw_response_text) from error
@@ -596,7 +617,7 @@ def analyze_commander(
             prompt=prompt,
             model=COMMANDER_MODEL,
         )
-        parsed = json.loads(raw_response_text)
+        parsed = json.loads(extract_json_object_text(raw_response_text))
         normalized = validate_commander_response(parsed)
         return {
             "model": COMMANDER_MODEL,
