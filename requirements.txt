@@ -2,3 +2,4 @@ selenium
 Pillow
 google-genai
 python-dotenv
+moondream

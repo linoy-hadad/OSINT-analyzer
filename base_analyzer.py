@@ -9,6 +9,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import moondream as md
 from PIL import Image
 from dotenv import load_dotenv
 from google import genai
@@ -27,6 +28,7 @@ ANALYST_COUNT = 8
 CSV_PATH = Path("military_bases.csv")
 OUTPUT_DIR = Path("screenshots")
 DATA_JSON_PATH = Path("data.json")
+DEBUG_OUTPUT_DIR = Path("analyses")
 
 SCREENSHOT_WIDTH = 1024
 PAGE_LOAD_WAIT_SECONDS = 6
@@ -47,7 +49,11 @@ LON_STEP_CITY = 0.001
 
 ANALYST_MODEL = "gemini-2.5-flash-lite"
 COMMANDER_MODEL = "gemini-2.5-flash"
+MOONDREAM_MODEL = "moondream-3-preview"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
+MOONDREAM_API_KEY_ENV_VAR = "MOONDREAM_API_KEY"
+GEMINI_MAX_RETRIES = 3
+GEMINI_RETRY_WAIT_SECONDS = 5
 
 ALLOWED_ACTIONS = {"zoom-in", "zoom-out", "move-left", "move-right", "finish"}
 REQUIRED_ANALYST_KEYS = {
@@ -55,6 +61,7 @@ REQUIRED_ANALYST_KEYS = {
     "analysis",
     "things_to_continue_analyzing",
     "action",
+    "question",
 }
 REQUIRED_COMMANDER_KEYS = {
     "findings",
@@ -67,6 +74,16 @@ class GeminiAnalysisError(Exception):
     def __init__(self, message: str, raw_response_text: str | None = None) -> None:
         super().__init__(message)
         self.raw_response_text = raw_response_text
+
+
+def build_consultant_question_instructions() -> str:
+    return """
+You also have access to an external visual consultant. She specializes in object-level image analysis: counting objects, identifying visual patterns, estimating object locations, and describing coordinates or areas within the image.
+
+In the "question" field, ask her one specific question that would help the next analyst verify or deepen your assessment. Prefer concrete visual questions about counts, object types, locations, coordinates, suspicious structures, vehicles, aircraft, launchers, bunkers, radars, storage areas, roads, or infrastructure.
+
+Ask only one question. If you are uncertain what to ask, ask a broad visual question about suspicious military-related objects or infrastructure in the image.
+""".strip()
 
 
 def format_camera_value(value: float) -> str:
@@ -172,6 +189,7 @@ def apply_action_to_camera_state(camera_state: dict[str, float], action: str) ->
 
 
 def build_base_prompt(country: str) -> str:
+    consultant_instructions = build_consultant_question_instructions()
     return f"""
 You are the world first expert in understanding satellite imagery and you work for the US army. We got intel that this area is a base/facility of the millitary of {country}. As an expert, analyze this image, find millitary related things - structures and anything suspicous.
 
@@ -184,8 +202,11 @@ Respond ONLY with a valid JSON object with exactly these keys:
   "things_to_continue_analyzing": [
     "A list of things that you think are important to continue analyzing in further images, like areas to focus on, zoom into, structures to investigate, and so on."
   ],
-  "action": "One of: zoom-in, zoom-out, move-left, move-right, finish"
+  "action": "One of: zoom-in, zoom-out, move-left, move-right, finish",
+  "question": "One specific question for the external visual consultant."
 }}
+
+{consultant_instructions}
 
 Action rules:
 - Choose "zoom-in" if you need to zoom in the image.
@@ -199,13 +220,24 @@ If uncertain, say so clearly inside the JSON fields instead of inventing facts.
 """.strip()
 
 
-def build_analysis_prompt(country: str, history_of_analysts: dict[str, str] | None = None) -> str:
+def build_analysis_prompt(
+    country: str,
+    history_of_analysts: dict[str, str] | None = None,
+    consultant_qas: list[dict[str, Any]] | None = None,
+) -> str:
     if not history_of_analysts:
         return build_base_prompt(country)
 
     serialized_history = json.dumps(history_of_analysts, indent=2, ensure_ascii=False)
+    serialized_consultant_qas = json.dumps(consultant_qas or [], indent=2, ensure_ascii=False)
+    consultant_instructions = build_consultant_question_instructions()
     return f"""
 You are the world first expert in understanding satellite imagery and you work for the US army. We got intel that this area is a base/facility of the millitary of {country}. Here is the analysis of previous analysts about this area and their recommendations. You can use this data but don't use it as fact, think for yourself: {serialized_history}
+
+Previous analysts asked the external consultant these questions, and here are her answers:
+{serialized_consultant_qas}
+
+Use this as helpful context, but do not treat it as guaranteed fact. Think independently from the current image.
 
 Respond ONLY with a valid JSON object with exactly these keys:
 {{
@@ -216,8 +248,11 @@ Respond ONLY with a valid JSON object with exactly these keys:
   "things_to_continue_analyzing": [
     "A list of things that you think are important to continue analyzing in further images, like areas to focus on, zoom into, structures to investigate, and so on."
   ],
-  "action": "One of: zoom-in, zoom-out, move-left, move-right, finish"
+  "action": "One of: zoom-in, zoom-out, move-left, move-right, finish",
+  "question": "One specific question for the external visual consultant."
 }}
+
+{consultant_instructions}
 
 Action rules:
 - Choose "zoom-in" if you need to zoom in the image.
@@ -231,10 +266,18 @@ If uncertain, say so clearly inside the JSON fields instead of inventing facts.
 """.strip()
 
 
-def build_commander_prompt(history_of_analysts: dict[str, str]) -> str:
+def build_commander_prompt(
+    history_of_analysts: dict[str, str],
+    consultant_qas: list[dict[str, Any]] | None = None,
+) -> str:
     serialized_history = json.dumps(history_of_analysts, indent=2, ensure_ascii=False)
+    serialized_consultant_qas = json.dumps(consultant_qas or [], indent=2, ensure_ascii=False)
     return f"""
-You are a commander of intelligence analysts in the us military. Your analysts got this image and an intel that this area is probably an enemy base/area. Here is the history of what the analysts said (each one was written by a different analyst) - {serialized_history}. As their commander, you should read their estimates and give a final conclustion that includes:
+You are a commander of intelligence analysts in the us military. Your analysts got this image and an intel that this area is probably an enemy base/area. Here is the history of what the analysts said (each one was written by a different analyst) - {serialized_history}.
+
+The analysts also asked an external visual consultant object-level questions. The consultant specializes in counting objects, locating visible objects, and answering concrete visual questions. Here are the consultant questions and answers: {serialized_consultant_qas}. Use these answers as supporting evidence, but do not treat them as guaranteed fact.
+
+As their commander, you should read their estimates and give a final conclustion that includes:
 1. findings: summary of all the findings your analysts found plus things you noticed yourself. This part should include only findings, structures, and everything that can be seen in the image.
 2. analysis: your final analysis based on what your analysts think and what you additionally add. Tell us what this place is, the chances that the intel is correct, and the meaning of the findings.
 3. final_steps: tell us what the us army should do with that, for example follow this base regularly, ignore it, get more images, or prepare an intelligence document.
@@ -312,6 +355,12 @@ def save_data_json(data: dict[str, Any]) -> None:
         json.dump(data, data_file, indent=2, ensure_ascii=False)
 
 
+def save_debug_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as debug_file:
+        json.dump(data, debug_file, indent=2, ensure_ascii=False)
+
+
 def create_gemini_client() -> genai.Client:
     api_key = os.getenv(GOOGLE_API_KEY_ENV_VAR, "").strip()
     if not api_key:
@@ -321,6 +370,17 @@ def create_gemini_client() -> genai.Client:
         )
 
     return genai.Client(api_key=api_key)
+
+
+def create_moondream_client() -> Any:
+    api_key = os.getenv(MOONDREAM_API_KEY_ENV_VAR, "").strip()
+    if not api_key:
+        raise ValueError(
+            f"Missing {MOONDREAM_API_KEY_ENV_VAR} environment variable. "
+            "Set it before running Moondream consultant analysis."
+        )
+
+    return md.vl(api_key=api_key)
 
 
 def create_driver() -> webdriver.Chrome:
@@ -407,11 +467,19 @@ def validate_analyst_response(data: object) -> dict[str, object]:
     if action not in ALLOWED_ACTIONS:
         raise ValueError(f"'action' must be one of: {', '.join(sorted(ALLOWED_ACTIONS))}.")
 
+    question = data["question"]
+    if not isinstance(question, str):
+        raise ValueError("'question' must be a string.")
+    question = question.strip()
+    if not question:
+        raise ValueError("'question' must not be empty.")
+
     return {
         "findings": findings,
         "analysis": analysis,
         "things_to_continue_analyzing": continue_items,
         "action": action,
+        "question": question,
     }
 
 
@@ -439,6 +507,17 @@ def validate_commander_response(data: object) -> dict[str, object]:
     }
 
 
+def is_transient_gemini_error(value: object) -> bool:
+    text = str(value).lower()
+    transient_markers = (
+        "503",
+        "unavailable",
+        "service unavailable",
+        "overloaded",
+    )
+    return any(marker in text for marker in transient_markers)
+
+
 def call_gemini_with_image(
     client: genai.Client,
     image_path: Path,
@@ -446,19 +525,39 @@ def call_gemini_with_image(
     model: str,
 ) -> str:
     image_bytes = image_path.read_bytes()
-    response = client.models.generate_content(
-        model=model,
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            prompt,
-        ],
-    )
 
-    raw_response_text = (response.text or "").strip()
-    if not raw_response_text:
-        raise GeminiAnalysisError("Gemini returned an empty response.")
+    max_attempts = GEMINI_MAX_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt,
+                ],
+            )
+            raw_response_text = (response.text or "").strip()
+            if is_transient_gemini_error(raw_response_text) and attempt < max_attempts:
+                time.sleep(GEMINI_RETRY_WAIT_SECONDS)
+                continue
 
-    return raw_response_text
+            if is_transient_gemini_error(raw_response_text):
+                raise GeminiAnalysisError(
+                    "Gemini returned a transient service error after retries.",
+                    raw_response_text,
+                )
+
+            if not raw_response_text:
+                raise GeminiAnalysisError("Gemini returned an empty response.")
+
+            return raw_response_text
+        except Exception as error:
+            if attempt < max_attempts and is_transient_gemini_error(error):
+                time.sleep(GEMINI_RETRY_WAIT_SECONDS)
+                continue
+            raise
+
+    raise GeminiAnalysisError("Gemini request failed after retries.")
 
 
 def analyze_image(
@@ -486,8 +585,9 @@ def analyze_commander(
     client: genai.Client,
     image_path: Path,
     history_of_analysts: dict[str, str],
+    consultant_qas: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    prompt = build_commander_prompt(history_of_analysts)
+    prompt = build_commander_prompt(history_of_analysts, consultant_qas)
 
     try:
         raw_response_text = call_gemini_with_image(
@@ -523,6 +623,107 @@ def analyze_commander(
             "status": "error",
             "error": str(error),
         }
+
+
+def extract_moondream_answer(result: object) -> str:
+    if isinstance(result, dict):
+        answer = result.get("answer", "")
+    else:
+        answer = getattr(result, "answer", "")
+
+    return str(answer or "").strip()
+
+
+def extract_moondream_request_id(result: object) -> str | None:
+    if isinstance(result, dict):
+        request_id = result.get("request_id")
+    else:
+        request_id = getattr(result, "request_id", None)
+
+    if request_id is None:
+        return None
+
+    return str(request_id)
+
+
+def build_compact_analysis_record(
+    analyst_number: int,
+    base_id: str,
+    validated_response: dict[str, object],
+) -> dict[str, Any]:
+    return {
+        "analyst_number": analyst_number,
+        "base_id": base_id,
+        "findings": validated_response["findings"],
+        "analysis": validated_response["analysis"],
+        "things_to_continue_analyzing": validated_response[
+            "things_to_continue_analyzing"
+        ],
+        "action": validated_response["action"],
+        "question": validated_response["question"],
+        "answer": None,
+    }
+
+
+def update_compact_analysis_answer(
+    compact_analyses: list[dict[str, Any]],
+    asked_by_analyst: int,
+    answer: object,
+) -> None:
+    for analysis_record in compact_analyses:
+        if analysis_record["analyst_number"] == asked_by_analyst:
+            analysis_record["answer"] = answer
+            return
+
+
+def build_compact_commander_record(commander_payload: dict[str, Any]) -> dict[str, Any]:
+    validated_response = commander_payload.get("validated_response")
+    if isinstance(validated_response, dict):
+        return {
+            "findings": validated_response.get("findings", []),
+            "analysis": validated_response.get("analysis", ""),
+            "final_steps": validated_response.get("final_steps", []),
+        }
+
+    return {
+        "findings": [],
+        "analysis": "",
+        "final_steps": [],
+    }
+
+
+def ask_moondream(
+    moondream_client: Any,
+    image_path: Path,
+    question: str,
+    asked_by_analyst: int,
+    answered_before_analyst: int | None,
+    image_url: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": MOONDREAM_MODEL,
+        "asked_by_analyst": asked_by_analyst,
+        "answered_before_analyst": answered_before_analyst,
+        "image_path": str(image_path),
+        "image_url": image_url,
+        "question": question,
+        "answer": None,
+        "request_id": None,
+        "status": "error",
+        "error": None,
+    }
+
+    try:
+        with Image.open(image_path) as image:
+            result = moondream_client.query(image, question)
+
+        payload["answer"] = extract_moondream_answer(result)
+        payload["request_id"] = extract_moondream_request_id(result)
+        payload["status"] = "success"
+    except Exception as error:
+        payload["error"] = str(error)
+
+    return payload
 
 
 def hide_page_toolbars(driver: webdriver.Chrome) -> None:
@@ -592,9 +793,11 @@ def build_error_response_text(message: str) -> str:
 def process_rows(
     rows: list[dict[str, str]],
     gemini_client: genai.Client,
+    moondream_client: Any,
     persisted_data: dict[str, Any],
 ) -> dict[str, dict[str, str]]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     rows_to_handle = rows[:ROWS_TO_PROCESS]
     history_of_analysts_by_row: dict[str, dict[str, str]] = {}
@@ -632,6 +835,9 @@ def process_rows(
             history_of_analysts: dict[str, str] = {}
             history_of_analysts_by_row[base_id] = history_of_analysts
             analyst_steps: list[dict[str, Any]] = []
+            consultant_qas: list[dict[str, Any]] = []
+            compact_analyses: list[dict[str, Any]] = []
+            pending_consultant_question: dict[str, Any] | None = None
 
             current_image_path: Path | None = None
             first_image_path: Path | None = None
@@ -642,11 +848,8 @@ def process_rows(
                 analyst_key = f"analyst_{analyst_number}"
                 analyst_image_path = screenshot_folder / f"{analyst_key}.jpg"
                 input_image_path = analyst_image_path
-                prompt = build_analysis_prompt(
-                    country=country,
-                    history_of_analysts=history_of_analysts if analyst_number > 1 else None,
-                )
                 input_url = current_url
+                consultant_response_for_step: dict[str, Any] | None = None
 
                 if capture_new_image:
                     try:
@@ -667,6 +870,8 @@ def process_rows(
                                 "input_url": input_url,
                                 "raw_response_text": raw_response_text,
                                 "validated_response": None,
+                                "consultant_response_before_analysis": None,
+                                "question": None,
                                 "action": None,
                                 "next_url": current_url,
                                 "status": "error",
@@ -691,6 +896,8 @@ def process_rows(
                             "input_url": input_url,
                             "raw_response_text": raw_response_text,
                             "validated_response": None,
+                            "consultant_response_before_analysis": None,
+                            "question": None,
                             "action": None,
                             "next_url": current_url,
                             "status": "error",
@@ -700,6 +907,32 @@ def process_rows(
                     print(f"Row {index} (id={base_id}): {error_message}")
                     continue
 
+                if pending_consultant_question is not None:
+                    consultant_response_for_step = ask_moondream(
+                        moondream_client=moondream_client,
+                        image_path=input_image_path,
+                        question=str(pending_consultant_question["question"]),
+                        asked_by_analyst=int(pending_consultant_question["asked_by_analyst"]),
+                        answered_before_analyst=analyst_number,
+                        image_url=input_url,
+                    )
+                    consultant_qas.append(consultant_response_for_step)
+                    update_compact_analysis_answer(
+                        compact_analyses,
+                        int(consultant_response_for_step["asked_by_analyst"]),
+                        consultant_response_for_step.get("answer"),
+                    )
+                    pending_consultant_question = None
+                    print(
+                        f"Saved Moondream consultant response before analyst_{analyst_number}"
+                    )
+
+                prompt = build_analysis_prompt(
+                    country=country,
+                    history_of_analysts=history_of_analysts if analyst_number > 1 else None,
+                    consultant_qas=consultant_qas,
+                )
+
                 try:
                     raw_response_text, validated_response = analyze_image(
                         gemini_client,
@@ -708,6 +941,14 @@ def process_rows(
                     )
                     history_of_analysts[analyst_key] = raw_response_text
                     action = str(validated_response["action"])
+                    question = str(validated_response["question"])
+                    compact_analyses.append(
+                        build_compact_analysis_record(
+                            analyst_number,
+                            base_id,
+                            validated_response,
+                        )
+                    )
 
                     next_url = current_url
                     if not freeze_view:
@@ -723,6 +964,11 @@ def process_rows(
                             current_url = next_url
                             capture_new_image = True
 
+                    pending_consultant_question = {
+                        "asked_by_analyst": analyst_number,
+                        "question": question,
+                    }
+
                     analyst_steps.append(
                         {
                             "analyst_number": analyst_number,
@@ -730,6 +976,8 @@ def process_rows(
                             "input_url": input_url,
                             "raw_response_text": raw_response_text,
                             "validated_response": validated_response,
+                            "consultant_response_before_analysis": consultant_response_for_step,
+                            "question": question,
                             "action": action,
                             "next_url": next_url,
                             "status": "success",
@@ -756,6 +1004,8 @@ def process_rows(
                             "input_url": input_url,
                             "raw_response_text": raw_response_text,
                             "validated_response": None,
+                            "consultant_response_before_analysis": consultant_response_for_step,
+                            "question": None,
                             "action": None,
                             "next_url": current_url,
                             "status": "error",
@@ -764,10 +1014,71 @@ def process_rows(
                     )
                     print(f"Row {index} (id={base_id}): Gemini analysis failed: {error}")
 
+            if pending_consultant_question is not None:
+                final_consultant_image_path = screenshot_folder / "final_consultant.jpg"
+                final_consultant_url = current_url
+                final_consultant_error: str | None = None
+
+                try:
+                    if capture_new_image:
+                        capture_current_view(driver, current_url, final_consultant_image_path)
+                        current_image_path = final_consultant_image_path
+                        capture_new_image = False
+                        print(f"Saved {final_consultant_image_path}")
+                    elif current_image_path is not None:
+                        shutil.copy2(current_image_path, final_consultant_image_path)
+                        current_image_path = final_consultant_image_path
+                        print(f"Reused image for final consultant: {final_consultant_image_path}")
+                    else:
+                        final_consultant_error = "No screenshot available for final Moondream analysis."
+                except (TimeoutException, WebDriverException, OSError) as error:
+                    final_consultant_error = f"Final consultant screenshot capture failed: {error}"
+
+                if final_consultant_error is None and final_consultant_image_path.exists():
+                    final_consultant_response = ask_moondream(
+                        moondream_client=moondream_client,
+                        image_path=final_consultant_image_path,
+                        question=str(pending_consultant_question["question"]),
+                        asked_by_analyst=int(pending_consultant_question["asked_by_analyst"]),
+                        answered_before_analyst=None,
+                        image_url=final_consultant_url,
+                    )
+                    consultant_qas.append(final_consultant_response)
+                    update_compact_analysis_answer(
+                        compact_analyses,
+                        int(final_consultant_response["asked_by_analyst"]),
+                        final_consultant_response.get("answer"),
+                    )
+                    print("Saved final Moondream consultant response")
+                else:
+                    final_consultant_response = {
+                        "model": MOONDREAM_MODEL,
+                        "asked_by_analyst": int(
+                            pending_consultant_question["asked_by_analyst"]
+                        ),
+                        "answered_before_analyst": None,
+                        "image_path": str(final_consultant_image_path),
+                        "image_url": final_consultant_url,
+                        "question": str(pending_consultant_question["question"]),
+                        "answer": None,
+                        "request_id": None,
+                        "status": "error",
+                        "error": final_consultant_error,
+                    }
+                    consultant_qas.append(final_consultant_response)
+                    update_compact_analysis_answer(
+                        compact_analyses,
+                        int(final_consultant_response["asked_by_analyst"]),
+                        final_consultant_response.get("answer"),
+                    )
+                    print(f"Row {index} (id={base_id}): {final_consultant_error}")
+
+                pending_consultant_question = None
+
             commander_payload = {
                 "model": COMMANDER_MODEL,
                 "input_image_path": str(first_image_path) if first_image_path is not None else None,
-                "prompt": build_commander_prompt(history_of_analysts),
+                "prompt": build_commander_prompt(history_of_analysts, consultant_qas),
                 "raw_response_text": None,
                 "validated_response": None,
                 "status": "error",
@@ -778,7 +1089,22 @@ def process_rows(
                     gemini_client,
                     first_image_path,
                     history_of_analysts,
+                    consultant_qas,
                 )
+
+            debug_file_path = DEBUG_OUTPUT_DIR / f"base_{base_id}_debug.json"
+            debug_record = {
+                "base_id": base_id,
+                "country": country,
+                "initial_google_earth_link": initial_earth_url,
+                "final_google_earth_link": current_url,
+                "screenshot_folder": str(screenshot_folder),
+                "history_of_analysts": history_of_analysts,
+                "consultant_qas": consultant_qas,
+                "analyst_steps": analyst_steps,
+                "commander": commander_payload,
+            }
+            save_debug_json(debug_file_path, debug_record)
 
             place_record = {
                 "base_id": base_id,
@@ -786,9 +1112,9 @@ def process_rows(
                 "initial_google_earth_link": initial_earth_url,
                 "final_google_earth_link": current_url,
                 "screenshot_folder": str(screenshot_folder),
-                "history_of_analysts": history_of_analysts,
-                "analyst_steps": analyst_steps,
-                "commander": commander_payload,
+                "analyses": compact_analyses,
+                "commander": build_compact_commander_record(commander_payload),
+                "debug_file": str(debug_file_path),
             }
 
             persisted_data[base_id] = place_record
@@ -805,7 +1131,8 @@ def main() -> None:
     rows = ensure_google_earth_links(CSV_PATH)
     persisted_data = load_data_json()
     gemini_client = create_gemini_client()
-    process_rows(rows, gemini_client, persisted_data)
+    moondream_client = create_moondream_client()
+    process_rows(rows, gemini_client, moondream_client, persisted_data)
 
 
 if __name__ == "__main__":
