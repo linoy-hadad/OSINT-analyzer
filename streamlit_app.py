@@ -85,6 +85,18 @@ def overview_image_path(record: dict[str, Any]) -> Path | None:
     return None
 
 
+def analyzed_image_path(record: dict[str, Any]) -> Path | None:
+    image_path = str(record.get("analyzed_image_path") or "").strip()
+    if not image_path:
+        return None
+
+    candidate = Path(image_path)
+    if candidate.exists():
+        return candidate
+
+    return None
+
+
 def analyst_image_path(record: dict[str, Any], analyst_number: int) -> Path | None:
     candidate = get_screenshot_folder(record) / f"analyst_{analyst_number}.jpg"
     if candidate.exists():
@@ -140,6 +152,49 @@ def commander_summary(record: dict[str, Any]) -> str:
     return str(value or "").strip()
 
 
+def threat_level(record: dict[str, Any]) -> int | None:
+    value = commander(record).get("threat_level")
+    if isinstance(value, bool):
+        return None
+
+    try:
+        level = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    if level < 1 or level > 5:
+        return None
+
+    return level
+
+
+def threat_label(record: dict[str, Any]) -> str:
+    level = threat_level(record)
+    if level is None:
+        return "Threat: unknown"
+
+    labels = {
+        1: "Routine Activity",
+        2: "Suspicious Activity",
+        3: "Monitor Closely",
+        4: "High Threat",
+        5: "Critical Threat",
+    }
+    return f"Level {level}: {labels[level]}"
+
+
+def most_suspicious_base(records: dict[str, dict[str, Any]]) -> tuple[str, dict[str, Any]] | None:
+    scored_records = [
+        (base_id, record)
+        for base_id, record in records.items()
+        if threat_level(record) is not None
+    ]
+    if not scored_records:
+        return None
+
+    return max(scored_records, key=lambda item: threat_level(item[1]) or 0)
+
+
 def render_css() -> None:
     st.markdown(
         """
@@ -154,7 +209,7 @@ def render_css() -> None:
         }
         .block-container {
             max-width: 1240px;
-            padding-top: 2.4rem;
+            padding-top: 4.25rem;
             padding-bottom: 3rem;
         }
         .intel-kicker {
@@ -176,7 +231,6 @@ def render_css() -> None:
             font-size: 1rem;
             max-width: 780px;
         }
-        .report-card,
         .panel,
         .analyst-card {
             border: 1px solid rgba(143, 179, 255, 0.18);
@@ -184,9 +238,6 @@ def render_css() -> None:
             border-radius: 8px;
             padding: 1rem;
             box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
-        }
-        .report-card {
-            min-height: 230px;
         }
         .card-title {
             color: #f3f7fb;
@@ -216,6 +267,31 @@ def render_css() -> None:
             border-color: rgba(255, 196, 87, 0.34);
             color: #ffd58c;
             background: rgba(255, 196, 87, 0.08);
+        }
+        .threat-pill {
+            border-color: rgba(255, 128, 128, 0.38);
+            color: #ffb4b4;
+            background: rgba(255, 128, 128, 0.09);
+        }
+        .metric-card {
+            border: 1px solid rgba(143, 179, 255, 0.18);
+            background: rgba(19, 27, 36, 0.72);
+            border-radius: 8px;
+            padding: 0.95rem 1rem;
+            min-height: 104px;
+        }
+        .metric-label {
+            color: #9aa9b8;
+            font-size: 0.78rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .metric-value {
+            color: #f3f7fb;
+            font-size: 1.55rem;
+            font-weight: 800;
+            margin-top: 0.25rem;
         }
         .section-title {
             color: #f3f7fb;
@@ -297,9 +373,40 @@ def render_gallery(records: dict[str, dict[str, Any]]) -> None:
     st.markdown('<div class="intel-kicker">OSINT ANALYSIS VIEWER</div>', unsafe_allow_html=True)
     st.markdown('<div class="intel-title">Intelligence Report Gallery</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="intel-subtitle">Browse analyzed bases, inspect analyst reasoning, and review commander conclusions from the compact data file.</div>',
+        '<div class="intel-subtitle">Browse analyzed bases, inspect analyst reasoning, and review commander conclusions</div>',
         unsafe_allow_html=True,
     )
+
+    suspicious = most_suspicious_base(records)
+    metric_cols = st.columns(2)
+    with metric_cols[0]:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+              <div class="metric-label">Total analyzed bases</div>
+              <div class="metric-value">{len(records)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with metric_cols[1]:
+        if suspicious is None:
+            suspicious_text = "Unknown"
+            suspicious_detail = "Available after the next analysis run"
+        else:
+            suspicious_id, suspicious_record = suspicious
+            suspicious_text = f"Base {suspicious_id}"
+            suspicious_detail = threat_label(suspicious_record)
+        st.markdown(
+            f"""
+            <div class="metric-card">
+              <div class="metric-label">Most suspicious base</div>
+              <div class="metric-value">{suspicious_text}</div>
+              <div class="muted">{suspicious_detail}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     query = st.text_input("Search by base ID or country", placeholder="Example: 147 or Egypt")
     filtered_items = []
@@ -315,7 +422,7 @@ def render_gallery(records: dict[str, dict[str, Any]]) -> None:
     cols = st.columns(3)
     for index, (base_id, record) in enumerate(filtered_items):
         analyses = get_analyses(record)
-        image_path = overview_image_path(record)
+        image_path = analyzed_image_path(record) or overview_image_path(record)
         missing = []
         if image_path is None:
             missing.append("overview image missing")
@@ -326,39 +433,46 @@ def render_gallery(records: dict[str, dict[str, Any]]) -> None:
             missing.append(f"skipped analysts: {', '.join(str(item) for item in skipped)}")
 
         with cols[index % 3]:
-            st.markdown('<div class="report-card">', unsafe_allow_html=True)
-            if image_path is not None:
-                st.image(str(image_path), use_container_width=True)
-            else:
-                render_missing_image("No overview image available")
+            with st.container(border=True):
+                if image_path is not None:
+                    caption = (
+                        "Geo-visual expert analysis"
+                        if analyzed_image_path(record) is not None
+                        else None
+                    )
+                    if caption:
+                        st.caption(caption)
+                    st.image(str(image_path), use_container_width=True)
+                else:
+                    render_missing_image("No overview image available")
 
-            st.markdown(
-                f"""
-                <div class="card-title">Base {base_id}</div>
-                <div class="muted">{record.get("country", "Unknown")}</div>
-                <div class="metric-row">
-                  <span class="pill">{len(analyses)} analysts</span>
-                  <span class="pill">{total_findings(analyses)} findings</span>
-                  <span class="pill">final action: {final_action(analyses)}</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            for warning in missing:
                 st.markdown(
-                    f'<span class="pill warning-pill">{warning}</span>',
+                    f"""
+                    <div class="card-title">Base {base_id}</div>
+                    <div class="muted">{record.get("country", "Unknown")}</div>
+                    <div class="metric-row">
+                      <span class="pill">{len(analyses)} analysts</span>
+                      <span class="pill">{total_findings(analyses)} findings</span>
+                      <span class="pill">final action: {final_action(analyses)}</span>
+                      <span class="pill threat-pill">{threat_label(record)}</span>
+                    </div>
+                    """,
                     unsafe_allow_html=True,
                 )
 
-            preview = text_preview(commander_summary(record), 260)
-            if preview:
-                st.caption(preview)
+                for warning in missing:
+                    st.markdown(
+                        f'<span class="pill warning-pill">{warning}</span>',
+                        unsafe_allow_html=True,
+                    )
 
-            if st.button("Open dossier", key=f"open_{base_id}"):
-                st.session_state.selected_base_id = base_id
-                st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
+                preview = text_preview(commander_summary(record), 260)
+                if preview:
+                    st.caption(preview)
+
+                if st.button("Open the full Intelligence Report", key=f"open_{base_id}"):
+                    st.session_state.selected_base_id = base_id
+                    st.rerun()
 
 
 def render_top_links(record: dict[str, Any]) -> None:
@@ -385,25 +499,37 @@ def render_commander_panel(record: dict[str, Any], compact: bool = False) -> Non
     analysis = str(value.get("analysis") or "").strip()
     final_steps = list_text(value.get("final_steps"))
 
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("### Commander Assessment")
-    if analysis:
-        st.write(analysis if not compact else text_preview(analysis, 520))
-    else:
-        st.warning("Commander output is missing.")
+    with st.container(border=True):
+        st.markdown("### Commander Assessment")
+        st.markdown(
+            f'<span class="pill threat-pill">{threat_label(record)}</span>',
+            unsafe_allow_html=True,
+        )
 
-    if not compact:
-        render_list("Commander Findings", findings)
-        render_list("Final Steps", final_steps)
-        summary = {
-            "findings": findings,
-            "analysis": analysis,
-            "final_steps": final_steps,
-        }
-        with st.expander("Copy commander summary", expanded=False):
-            st.code(json.dumps(summary, indent=2, ensure_ascii=False), language="json")
+        if compact:
+            if final_steps:
+                for step in final_steps:
+                    st.markdown(f"- {step}")
+            elif analysis:
+                st.write(text_preview(analysis, 520))
+            else:
+                st.warning("Commander output is missing.")
+        else:
+            if analysis:
+                st.write(analysis)
+            else:
+                st.warning("Commander output is missing.")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+            render_list("Commander Findings", findings)
+            render_list("Final Steps", final_steps)
+            summary = {
+                "findings": findings,
+                "analysis": analysis,
+                "final_steps": final_steps,
+                "threat_level": threat_level(record),
+            }
+            with st.expander("Copy commander summary", expanded=False):
+                st.code(json.dumps(summary, indent=2, ensure_ascii=False), language="json")
 
 
 def render_analysis(record: dict[str, Any], analysis: dict[str, Any]) -> None:
@@ -456,7 +582,7 @@ def render_analysis(record: dict[str, Any], analysis: dict[str, Any]) -> None:
             st.markdown(
                 f"""
                 <div class="answer-box">
-                  <strong>Moondream Answer</strong><br>{answer}
+                  <strong>The Geo-visual expert answer</strong><br>{answer}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -465,6 +591,33 @@ def render_analysis(record: dict[str, Any], analysis: dict[str, Any]) -> None:
             st.caption("No Moondream answer recorded for this question.")
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_analyzed_image_section(record: dict[str, Any]) -> None:
+    image_path = analyzed_image_path(record)
+    explanation = str(record.get("analyzed_image_explanation") or "").strip()
+
+    if image_path is None and not explanation:
+        return
+
+    with st.container(border=True):
+        st.markdown("### Geo-visual Expert Analysis")
+        left, right = st.columns([1.1, 0.9], gap="large")
+        with left:
+            if image_path is not None:
+                st.image(
+                    str(image_path),
+                    caption="The visual expert assistant analysis",
+                    use_container_width=True,
+                )
+            else:
+                render_missing_image("Analyzed image path is missing or unavailable")
+        with right:
+            st.markdown("#### Highlight Explanation")
+            if explanation:
+                st.write(explanation)
+            else:
+                st.caption("No analyzed-image explanation recorded.")
 
 
 def render_dossier(record: dict[str, Any]) -> None:
@@ -497,14 +650,15 @@ def render_dossier(record: dict[str, Any]) -> None:
     with hero_right:
         render_commander_panel(record, compact=True)
 
-    st.markdown('<div class="section-title">Analyst Brainstorming</div>', unsafe_allow_html=True)
+    render_analyzed_image_section(record)
+
+    render_commander_panel(record, compact=False)
+
+    st.markdown("### Analyst Brainstorming")
     if not analyses:
         st.info("No analyst records are available for this base.")
     for analysis in analyses:
         render_analysis(record, analysis)
-
-    st.markdown('<div class="section-title">Final Commander Conclusion</div>', unsafe_allow_html=True)
-    render_commander_panel(record, compact=False)
 
 
 def main() -> None:

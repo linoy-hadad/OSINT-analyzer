@@ -10,4 +10,4 @@ __pycache__/
 /analyses
 *.json
 /logs
-/.stramlit 
+secrets.toml 

@@ -54,6 +54,7 @@ GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 MOONDREAM_API_KEY_ENV_VAR = "MOONDREAM_API_KEY"
 GEMINI_MAX_RETRIES = 3
 GEMINI_RETRY_WAIT_SECONDS = 5
+GEMINI_RATE_LIMIT_DELAY_SECONDS = 2  # Small delay between consecutive calls to avoid rate limits
 
 ALLOWED_ACTIONS = {"zoom-in", "zoom-out", "move-left", "move-right", "finish"}
 REQUIRED_ANALYST_KEYS = {
@@ -514,6 +515,10 @@ def is_transient_gemini_error(value: object) -> bool:
         "unavailable",
         "service unavailable",
         "overloaded",
+        "429",
+        "too many requests",
+        "rate limit",
+        "quota exceeded",
     )
     return any(marker in text for marker in transient_markers)
 
@@ -559,7 +564,9 @@ def call_gemini_with_image(
             )
             raw_response_text = (response.text or "").strip()
             if is_transient_gemini_error(raw_response_text) and attempt < max_attempts:
-                time.sleep(GEMINI_RETRY_WAIT_SECONDS)
+                wait_time = GEMINI_RETRY_WAIT_SECONDS * (2 ** (attempt - 1))  # Exponential backoff
+                print(f"Rate limited by Gemini. Waiting {wait_time}s before retry (attempt {attempt}/{max_attempts})...")
+                time.sleep(wait_time)
                 continue
 
             if is_transient_gemini_error(raw_response_text):
@@ -574,7 +581,9 @@ def call_gemini_with_image(
             return raw_response_text
         except Exception as error:
             if attempt < max_attempts and is_transient_gemini_error(error):
-                time.sleep(GEMINI_RETRY_WAIT_SECONDS)
+                wait_time = GEMINI_RETRY_WAIT_SECONDS * (2 ** (attempt - 1))  # Exponential backoff
+                print(f"Gemini error, retrying in {wait_time}s (attempt {attempt}/{max_attempts})...")
+                time.sleep(wait_time)
                 continue
             raise
 
@@ -1006,6 +1015,7 @@ def process_rows(
                         }
                     )
                     print(f"Saved Gemini response for {analyst_key}")
+                    time.sleep(GEMINI_RATE_LIMIT_DELAY_SECONDS)  # Rate limit delay between calls
                 except Exception as error:
                     raw_response_text = getattr(error, "raw_response_text", None)
                     if raw_response_text is None and hasattr(error, "response"):
@@ -1112,6 +1122,7 @@ def process_rows(
                     history_of_analysts,
                     consultant_qas,
                 )
+                time.sleep(GEMINI_RATE_LIMIT_DELAY_SECONDS)  # Rate limit delay
 
             debug_file_path = DEBUG_OUTPUT_DIR / f"base_{base_id}_debug.json"
             debug_record = {
