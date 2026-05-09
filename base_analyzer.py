@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import moondream as md
-from PIL import Image
+from PIL import Image, ImageDraw
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -22,7 +22,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-ROWS_TO_PROCESS = 1
+ROWS_TO_PROCESS = 2 
 ANALYST_COUNT = 8
 
 CSV_PATH = Path("military_bases.csv")
@@ -47,8 +47,8 @@ ZOOM_IN_FACTOR = 0.85
 ZOOM_OUT_FACTOR = 1.20
 LON_STEP_CITY = 0.001
 
-ANALYST_MODEL = "gemini-2.5-flash-lite"
-COMMANDER_MODEL = "gemini-2.5-flash"
+ANALYST_MODEL = "gemini-3.1-flash-lite"
+COMMANDER_MODEL = "gemini-3-flash-preview"
 MOONDREAM_MODEL = "moondream-3-preview"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 MOONDREAM_API_KEY_ENV_VAR = "MOONDREAM_API_KEY"
@@ -68,6 +68,7 @@ REQUIRED_COMMANDER_KEYS = {
     "findings",
     "analysis",
     "final_steps",
+    "threat_level",
 }
 
 
@@ -282,6 +283,16 @@ As their commander, you should read their estimates and give a final conclustion
 1. findings: summary of all the findings your analysts found plus things you noticed yourself. This part should include only findings, structures, and everything that can be seen in the image.
 2. analysis: your final analysis based on what your analysts think and what you additionally add. Tell us what this place is, the chances that the intel is correct, and the meaning of the findings.
 3. final_steps: tell us what the us army should do with that, for example follow this base regularly, ignore it, get more images, or prepare an intelligence document.
+4. threat_level: determine the threat level of this base according to your analysts' assessments and your own estimation.
+
+The threat level should be a number between 1 and 5 following these rules:
+| Level | Name                    | Meaning                                                |
+| ----- | ----------------------- | ------------------------------------------------------ |
+| 1     | Routine Activity        | No unusual indicators detected                         |
+| 2     | Suspicious Activity     | Minor anomalies or unusual behavior observed           |
+| 3     | Monitor Closely         | Activity warrants continued intelligence tracking      |
+| 4     | High Threat             | Strong indicators of hostile preparation or escalation |
+| 5     | Critical Threat         | Immediate operational concern / likely hostile action  |
 
 Respond ONLY with a valid JSON object with exactly these keys:
 {{
@@ -291,7 +302,8 @@ Respond ONLY with a valid JSON object with exactly these keys:
   "analysis": "Your final commander analysis.",
   "final_steps": [
     "A list of recommended next steps."
-  ]
+  ],
+  "threat_level": "A number between 1 and 5 representing your final threat estimate."
 }}
 
 Do not include markdown fences.
@@ -501,10 +513,23 @@ def validate_commander_response(data: object) -> dict[str, object]:
         raise ValueError("'analysis' must be a string.")
     analysis = analysis.strip()
 
+    threat_level = data["threat_level"]
+    if isinstance(threat_level, bool):
+        raise ValueError("'threat_level' must be an integer between 1 and 5.")
+
+    try:
+        threat_level_int = int(threat_level)
+    except (TypeError, ValueError):
+        raise ValueError("'threat_level' must be an integer between 1 and 5.")
+
+    if threat_level_int < 1 or threat_level_int > 5:
+        raise ValueError("'threat_level' must be between 1 and 5.")
+
     return {
         "findings": findings,
         "analysis": analysis,
         "final_steps": final_steps,
+        "threat_level": threat_level_int,
     }
 
 
@@ -713,12 +738,14 @@ def build_compact_commander_record(commander_payload: dict[str, Any]) -> dict[st
             "findings": validated_response.get("findings", []),
             "analysis": validated_response.get("analysis", ""),
             "final_steps": validated_response.get("final_steps", []),
+            "threat_level": validated_response.get("threat_level"),
         }
 
     return {
         "findings": [],
         "analysis": "",
         "final_steps": [],
+        "threat_level": None,
     }
 
 
@@ -754,6 +781,191 @@ def ask_moondream(
         payload["error"] = str(error)
 
     return payload
+
+
+def extract_json_snippet(text: str) -> str | None:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    start_index = None
+    stack: list[str] = []
+    in_string = False
+    escape = False
+
+    for index, char in enumerate(cleaned):
+        if char == "\\" and not escape:
+            escape = True
+            continue
+
+        if char == '"' and not escape:
+            in_string = not in_string
+
+        if in_string:
+            escape = False
+            continue
+
+        if char in "[{":
+            if start_index is None:
+                start_index = index
+            stack.append(char)
+        elif char in "]}":
+            if not stack:
+                continue
+            opening = stack.pop()
+            if (opening == "{" and char != "}") or (opening == "[" and char != "]"):
+                stack.append(opening)
+                continue
+            if not stack and start_index is not None:
+                return cleaned[start_index : index + 1]
+
+    return None
+
+
+def parse_moondream_object_detections(answer: str, image_size: tuple[int, int] | None = None) -> list[dict[str, Any]]:
+    snippet = extract_json_snippet(answer)
+    if snippet is None:
+        return []
+
+    try:
+        parsed = json.loads(snippet)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("objects"), list):
+            parsed = parsed["objects"]
+        elif isinstance(parsed.get("detections"), list):
+            parsed = parsed["detections"]
+        else:
+            return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    objects: list[dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+
+        label = str(item.get("label") or item.get("name") or item.get("type") or "object").strip()
+        bbox = item.get("bounding_box") or item.get("bbox") or item.get("box")
+        if bbox is None:
+            continue
+
+        coords: list[float] = []
+        if isinstance(bbox, dict):
+            if all(key in bbox for key in ("x", "y", "width", "height")):
+                coords = [
+                    float(bbox["x"]),
+                    float(bbox["y"]),
+                    float(bbox["x"]) + float(bbox["width"]),
+                    float(bbox["y"]) + float(bbox["height"]),
+                ]
+            elif all(key in bbox for key in ("x1", "y1", "x2", "y2")):
+                coords = [
+                    float(bbox["x1"]),
+                    float(bbox["y1"]),
+                    float(bbox["x2"]),
+                    float(bbox["y2"]),
+                ]
+            else:
+                continue
+        elif isinstance(bbox, list) and len(bbox) == 4:
+            valid = True
+            for value in bbox:
+                if isinstance(value, bool):
+                    valid = False
+                    break
+                if isinstance(value, (int, float)):
+                    coords.append(float(value))
+                elif isinstance(value, str):
+                    try:
+                        coords.append(float(value))
+                    except ValueError:
+                        valid = False
+                        break
+                else:
+                    valid = False
+                    break
+            if not valid:
+                continue
+        else:
+            continue
+
+        if len(coords) != 4:
+            continue
+
+        if image_size is not None and all(0.0 <= coord <= 1.0 for coord in coords):
+            width, height = image_size
+            coords = [coords[0] * width, coords[1] * height, coords[2] * width, coords[3] * height]
+
+        x1, y1, x2, y2 = int(round(coords[0])), int(round(coords[1])), int(round(coords[2])), int(round(coords[3]))
+        objects.append({"label": label, "bbox": [x1, y1, x2, y2]})
+
+    return objects
+
+
+def parse_moondream_object_detection_answer(
+    answer: str,
+    image_size: tuple[int, int] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    objects = parse_moondream_object_detections(answer, image_size=image_size)
+    explanation = ""
+    snippet = extract_json_snippet(answer)
+    if snippet is None:
+        return objects, explanation
+
+    try:
+        parsed = json.loads(snippet)
+    except json.JSONDecodeError:
+        return objects, explanation
+
+    if isinstance(parsed, dict):
+        explanation_value = parsed.get("explanation") or parsed.get("description") or parsed.get("analysis")
+        if isinstance(explanation_value, (str, int, float, bool)):
+            explanation = str(explanation_value).strip()
+
+    return objects, explanation
+
+
+def draw_bounding_boxes(image_path: Path, objects: list[dict[str, Any]], output_path: Path) -> None:
+    with Image.open(image_path) as image:
+        draw = ImageDraw.Draw(image)
+        width, height = image.size
+        line_width = max(2, int(min(width, height) / 220))
+
+        for detected in objects:
+            x1, y1, x2, y2 = detected["bbox"]
+            label = str(detected.get("label", "object") or "object")
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=line_width)
+
+            text_position = (max(0, x1 + 4), max(0, y1 - 18))
+            try:
+                text_size = draw.textsize(label)
+            except Exception:
+                text_size = (len(label) * 6 + 6, 14)
+
+            label_box = [
+                text_position[0] - 2,
+                max(0, text_position[1] - 2),
+                text_position[0] + text_size[0] + 4,
+                text_position[1] + text_size[1] + 2,
+            ]
+            draw.rectangle(label_box, fill="red")
+            draw.text(text_position, label, fill="white")
+
+        image.save(output_path, format="JPEG", quality=90, optimize=True)
+
+
+def build_moondream_object_detection_question() -> str:
+    return (
+        "Identify all visible objects in this image such as buildings, infrastructure, vehicles, missile-related equipment, "
+        "or other military assets. Respond only with a valid JSON object containing the keys 'objects' and 'explanation'. "
+        "The 'objects' array must contain items with 'label' and 'bounding_box' as [x1, y1, x2, y2] pixel coordinates. "
+        "The 'explanation' field should provide a human-readable description of the objects you identified and the visible scene. "
+        "Do not include any markdown fences or any text outside the JSON."
+    )
 
 
 def hide_page_toolbars(driver: webdriver.Chrome) -> None:
@@ -1106,6 +1318,39 @@ def process_rows(
 
                 pending_consultant_question = None
 
+            analyzed_image_path = None
+            analyzed_image_explanation = None
+            object_detection_response: dict[str, Any] | None = None
+            analyst_eight_image = screenshot_folder / "analyst_8.jpg"
+            if analyst_eight_image.exists():
+                detection_question = build_moondream_object_detection_question()
+                object_detection_response = ask_moondream(
+                    moondream_client=moondream_client,
+                    image_path=analyst_eight_image,
+                    question=detection_question,
+                    asked_by_analyst=8,
+                    answered_before_analyst=None,
+                    image_url=initial_earth_url,
+                )
+                raw_detection_answer = str(object_detection_response.get("answer") or "").strip()
+                annotated_image_path = screenshot_folder / "analyzed_image.jpg"
+
+                with Image.open(analyst_eight_image) as sample_image:
+                    image_size = sample_image.size
+
+                objects, detected_explanation = parse_moondream_object_detection_answer(
+                    raw_detection_answer,
+                    image_size=image_size,
+                )
+
+                if objects:
+                    draw_bounding_boxes(analyst_eight_image, objects, annotated_image_path)
+                else:
+                    shutil.copy2(analyst_eight_image, annotated_image_path)
+
+                analyzed_image_path = str(annotated_image_path)
+                analyzed_image_explanation = detected_explanation
+
             commander_payload = {
                 "model": COMMANDER_MODEL,
                 "input_image_path": str(first_image_path) if first_image_path is not None else None,
@@ -1146,6 +1391,8 @@ def process_rows(
                 "screenshot_folder": str(screenshot_folder),
                 "analyses": compact_analyses,
                 "commander": build_compact_commander_record(commander_payload),
+                "analyzed_image_path": analyzed_image_path,
+                "analyzed_image_explanation": analyzed_image_explanation,
                 "debug_file": str(debug_file_path),
             }
 
