@@ -1,10 +1,10 @@
 # OSINT Analyzer
 
-A Python-based tool for automated geospatial intelligence analysis using Google Earth imagery, Gemini multimodal analysis, and Moondream visual consulting.
+A Python-based tool for automated geospatial intelligence analysis using Google Earth imagery, Gemini multimodal analysis,Moondream visual consulting.
 
 ## What it does
 
-- Reads military base coordinates from `military_bases.csv`
+- Reads military base coordinates from a military_bases csv file
 - Ensures each row includes a Google Earth link
 - Captures screenshots from Google Earth using Selenium
 - Sends images to Gemini for analyst-style satellite imagery analysis
@@ -63,7 +63,7 @@ The script will:
 
 ## Notes
 
-- The script currently processes only the first `ROWS_TO_PROCESS` rows.
+- The script currently processes only the first `ROWS_TO_PROCESS` rows 
 - If screenshots fail to capture, the script logs the error in debug output and continues.
 - The output directories are created automatically if missing.
 
